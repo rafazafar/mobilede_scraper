@@ -1,6 +1,7 @@
-import { chromium } from 'playwright';
+import { chromium } from 'patchright';
 import fs from 'fs';
 import path from 'path';
+import { consola } from 'consola';
 
 // 出力先ディレクトリを作成（存在しない場合は再帰的に作成）
 const outputDir = path.resolve('./output');
@@ -15,8 +16,10 @@ const HEADERS = [
 ];
 
 // 車リスト（スクレイピング対象URL群）をJSONから読み込み
-const carList = JSON.parse(fs.readFileSync('C:/Users/alexa/node.js/usedcarsales/car_urls.json', 'utf8'));
+const carList = JSON.parse(fs.readFileSync('./car_urls.json', 'utf8'));
 const results = []; // 最終的に保存する車両情報一覧
+
+consola.info(`📋 Loaded ${carList.length} cars from car_urls.json`);
 
 // プロキシはJSON形式のテキストファイルから読み込む想定
 const proxyTxt = fs.readFileSync('./socks4_socks5_proxies.txt', 'utf8');
@@ -140,17 +143,55 @@ async function saveDataToCSV(carData) {
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   const filename = path.join(outputDir, `mobilede_output_${timestamp}.csv`);
   fs.writeFileSync(filename, '\ufeff' + csvData); // BOM付きで保存（Excel互換性向上）
-  console.log(`CSVファイルを保存しました: ${filename}`);
+  consola.success(`📄 CSV saved: ${filename}`);
+}
+
+// 個別の車データをCSVに追記
+function appendCarToCSV(car, filename, isFirstRow = false) {
+  const rowData = HEADERS.map(header => {
+    let value = car[header];
+    if (value === null || value === undefined) value = '';
+    if (String(value).includes(',')) return `"${value}"`; // CSVエスケープ
+    return value;
+  });
+
+  const csvRow = rowData.join(',') + '\n';
+
+  if (isFirstRow) {
+    // 初回はヘッダー付きで書き込み
+    const headerRow = HEADERS.join(',') + '\n';
+    fs.writeFileSync(filename, '\ufeff' + headerRow + csvRow);
+  } else {
+    // 2回目以降は追記
+    fs.appendFileSync(filename, csvRow);
+  }
 }
 
 // プロキシ付きでブラウザ起動（失敗したら次のプロキシでリトライ）
 async function launchBrowserWithProxy(maxTries = proxyList.length) {
   let lastErr;
   for (let tries = 0; tries < maxTries; tries++) {
+    // TEMP: Disable proxy for testing - remove this line to re-enable
+    const USE_PROXY = false;
+
+    if (!USE_PROXY) {
+      const browser = await chromium.launchPersistentContext('', {
+        channel: 'chrome',
+        headless: true,
+        viewport: null
+      });
+      return { browser, proxy: 'NO_PROXY' };
+    }
+
     if (proxyList.length === 0) throw new Error('利用可能なプロキシがありません');
     const proxy = getNextProxy();
     try {
-      const browser = await chromium.launch({ headless: false, proxy: { server: proxy } });
+      const browser = await chromium.launchPersistentContext('', {
+        channel: 'chrome',
+        headless: false,
+        viewport: null,
+        proxy: { server: proxy }
+      });
       return { browser, proxy };
     } catch (e) {
       console.warn(`プロキシ接続失敗: ${proxy} - 除外します`);
@@ -164,53 +205,57 @@ async function launchBrowserWithProxy(maxTries = proxyList.length) {
 // メイン処理フロー
 
 (async () => {
+  const startTime = Date.now();
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const csvFilename = path.join(outputDir, `mobilede_output_${timestamp}.csv`);
+
+  consola.box(`🚗 Mobile.de Scraper Started\n📦 Total cars to process: ${carList.length}`);
+  consola.info(`💾 Incremental CSV output: ${csvFilename}`);
+
   for (let i = 0; i < carList.length; i++) {
     const car = carList[i];
+    const carNumber = i + 1;
     let browser = null, detailPage = null;
     let usedProxy = null;
 
+    consola.start(`[${carNumber}/${carList.length}] Processing: ${car.car_name || 'Unknown'}`);
+
     try {
       // プロキシを切り替えながらブラウザ起動
+      consola.info(`  ⚙️  Launching browser${usedProxy !== 'NO_PROXY' ? ' with proxy' : ''}...`);
       const launchResult = await launchBrowserWithProxy();
       browser = launchResult.browser;
       usedProxy = launchResult.proxy;
 
-      const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        locale: 'en-US',
-        viewport: { width: 1280, height: 800 },
-        timezoneId: 'Europe/Berlin'
-      });
+      if (usedProxy !== 'NO_PROXY') {
+        consola.debug(`  🔒 Using proxy: ${usedProxy}`);
+      }
 
-      // webdriver検知回避
-      await context.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      });
-
-      detailPage = await context.newPage();
-
-      // ページ遷移時のHTTPヘッダ追加
-      await detailPage.setExtraHTTPHeaders({
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://suchen.mobile.de/fahrzeuge/search.html?con=USED&dam=false&isSearchRequest=true&vc=Car&lang=en'
-      });
+      detailPage = await browser.newPage();
 
       // 人間っぽい挙動を追加
+      consola.debug('  🖱️  Simulating human behavior...');
       await randomMouseMove(detailPage);
       await randomScroll(detailPage);
       await sleep(800 + Math.random() * 1200);
 
       // 車両詳細ページへ遷移
       try {
-        await detailPage.goto(car.detail_url, { waitUntil: 'domcontentloaded' });
+        consola.info('  🌐 Loading detail page...');
+        await detailPage.goto(car.detail_url, {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000
+        });
       } catch (gotoErr) {
-        console.error(`詳細ページ取得エラー(page.goto): ${car.detail_url}`, gotoErr, `使用プロキシ: ${usedProxy}`);
-        const errorFile = path.join(outputDir, `goto_error_${i + 1}_${Date.now()}.png`);
+        consola.error(`  ❌ Page load failed: ${gotoErr.message}`);
+        const errorFile = path.join(outputDir, `goto_error_${carNumber}_${Date.now()}.png`);
         await detailPage.screenshot({ path: errorFile, fullPage: true });
-        continue; // 次の車種へスキップ
+        consola.warn(`  📸 Screenshot saved: ${path.basename(errorFile)}`);
+        continue;
       }
 
       // GDPRバナー処理
+      consola.debug('  🍪 Handling consent modals...');
       await handleConsentModal(detailPage);
 
       // さらに人間らしい挙動
@@ -219,15 +264,23 @@ async function launchBrowserWithProxy(maxTries = proxyList.length) {
       await sleep(1200 + Math.random() * 1500);
 
       // 車の詳細情報を抽出
+      consola.info('  📊 Extracting car details...');
       const details = await extractCarDetails(detailPage);
-      Object.assign(car, details); // carオブジェクトにマージ
+      Object.assign(car, details);
       results.push(car);
 
+      // 即座にCSVに追記
+      appendCarToCSV(car, csvFilename, i === 0);
+
+      const extractedFields = Object.keys(details).filter(k => details[k]).length;
+      consola.success(`  ✅ Extracted ${extractedFields} fields | Saved to CSV | Total: ${results.length}/${carList.length}`);
+
     } catch (e) {
-      console.error(`致命的エラー: ${car.detail_url}`, e, `使用プロキシ: ${usedProxy}`);
+      consola.error(`  💥 Fatal error: ${e.message}`);
       if (detailPage) {
-        const errorFile = path.join(outputDir, `fatal_error_${i + 1}_${Date.now()}.png`);
+        const errorFile = path.join(outputDir, `fatal_error_${carNumber}_${Date.now()}.png`);
         await detailPage.screenshot({ path: errorFile, fullPage: true });
+        consola.warn(`  📸 Error screenshot: ${path.basename(errorFile)}`);
       }
 
     } finally {
@@ -235,9 +288,11 @@ async function launchBrowserWithProxy(maxTries = proxyList.length) {
     }
 
     // --- 次の車に移る前に待機（サイトBan対策）---
-    await sleep(300000); // 5分休憩
+    // await sleep(300000); // 5分休憩
   }
 
-  // 全件終了後にCSV出力
-  await saveDataToCSV(results);
+  // 全件終了後のサマリー
+  const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(2);
+  consola.box(`🎉 Scraping Complete!\n✅ Processed: ${results.length}/${carList.length} cars\n⏱️  Time: ${elapsed} minutes\n📄 CSV file: ${csvFilename}`);
+  consola.success('✨ All done!');
 })();
